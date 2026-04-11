@@ -1,4 +1,4 @@
-"""
+﻿"""
 LiveTranslate - Phase 0 Prototype
 Real-time audio translation using WASAPI loopback + faster-whisper + LLM.
 """
@@ -40,7 +40,9 @@ from audio_capture import AudioCapture
 from vad_processor import VADProcessor
 from asr_engine import ASREngine
 from translator import Translator, RepetitionError
-
+from pipeline.segment_assembler import SegmentAssembler
+from pipeline.preview_committer import PreviewCommitter
+from services.asr_service import ASRRequest, ASRService
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QDialog, QMessageBox
 from PyQt6.QtGui import QAction, QActionGroup, QIcon, QPixmap, QPainter, QColor, QFont
 from PyQt6.QtCore import QTimer, Qt
@@ -178,6 +180,9 @@ class LiveTranslateApp:
         self._overlay = None
         self._subwin = None
         self._panel = None
+        self._segment_assembler = SegmentAssembler()
+        self._preview_committer = PreviewCommitter()
+        self._asr_service = None
         self._capture_thread = None
         self._asr_thread = None
         self._asr_queue = queue.Queue(maxsize=16)
@@ -190,6 +195,7 @@ class LiveTranslateApp:
         self._input_price = 0.0
         self._output_price = 0.0
         self._msg_id = 0
+        self._preview_seq = 0
         self._last_original = ""
         self._last_msg_id = 0
 
@@ -457,6 +463,7 @@ class LiveTranslateApp:
             return
 
         self._asr = new_asr[0]
+        self._asr_service = ASRService(self._asr)
         self._asr_type = engine_type
         if self._panel:
             asr_lang = self._panel.get_settings().get("asr_language", "auto")
@@ -471,6 +478,157 @@ class LiveTranslateApp:
             return (self._total_prompt_tokens * self._input_price +
                     self._total_completion_tokens * self._output_price) / 1_000_000
         return 0.0
+
+    def _transcribe_audio(self, audio, *, use_word_timestamps: bool = False):
+        with self._asr_lock:
+            if not self._asr_ready or self._asr_service is None:
+                return None
+            try:
+                return self._asr_service.transcribe(
+                    ASRRequest(
+                        audio=audio,
+                        use_word_timestamps=use_word_timestamps,
+                    )
+                )
+            except Exception as e:
+                log.error(f"ASR error: {e}", exc_info=True)
+                return None
+
+    def _is_valid_segment_text(self, text: str, *, seg_len: float | None = None) -> bool:
+        if not text or not any(c.isalnum() for c in text):
+            return False
+
+        if seg_len is not None:
+            alnum_chars = sum(1 for c in text if c.isalnum())
+            if seg_len >= 2.0 and alnum_chars <= 3:
+                log.debug(
+                    f"Noise filter: {seg_len:.1f}s segment produced only '{text}', skipping"
+                )
+                return False
+
+        return True
+
+    def _passes_language_filter(self, text: str, source_lang: str) -> bool:
+        asr_lang_setting = (
+            self._panel.get_settings().get("asr_language", "auto")
+            if self._panel
+            else "auto"
+        )
+        if asr_lang_setting != "auto" and source_lang != asr_lang_setting:
+            log.info(
+                f"Language filter: expected '{asr_lang_setting}' but got '{source_lang}', "
+                f"discarding: {text[:60]}"
+            )
+            return False
+        return True
+
+    def _build_committed_segment(
+        self,
+        text: str,
+        source_lang: str,
+        *,
+        asr_ms: float = 0.0,
+        seg_len: float | None = None,
+        from_preview: bool = False,
+    ):
+        original_text = text.strip()
+        if not self._is_valid_segment_text(original_text, seg_len=seg_len):
+            return None
+        if not self._passes_language_filter(original_text, source_lang):
+            return None
+
+        if from_preview:
+            self._preview_seq += 1
+            preview_segment = self._segment_assembler.build_segment(
+                segment_id=self._preview_seq,
+                text=original_text,
+                source_language=source_lang,
+                asr_ms=asr_ms,
+                is_preview=True,
+                metadata={"preview_source": True},
+            )
+            decision = self._preview_committer.commit_segment(
+                preview_segment,
+                committed_tail=self._interim_committed_tail,
+            )
+            if not decision.should_commit or not decision.committed_text.strip():
+                return None
+            original_text = decision.committed_text.strip()
+
+        self._asr_count += 1
+        self._msg_id += 1
+        msg_id = self._msg_id
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        return self._segment_assembler.build_segment(
+            segment_id=msg_id,
+            text=original_text,
+            source_language=source_lang,
+            asr_ms=asr_ms,
+            timestamp=timestamp,
+            is_preview=False,
+            metadata={"preview_source": from_preview},
+        )
+
+    def _emit_committed_segment(self, segment):
+        original_text = segment.text
+        source_lang = segment.source_language
+        msg_id = segment.segment_id
+        timestamp = segment.timestamp
+        asr_ms = segment.asr_ms
+        from_preview = bool(segment.metadata.get("preview_source"))
+
+        if from_preview:
+            log.info(f"ASR [{source_lang}] ({asr_ms:.0f}ms, committed from preview): {original_text}")
+        else:
+            log.info(f"ASR [{source_lang}] ({asr_ms:.0f}ms): {original_text}")
+
+        if self._overlay:
+            self._overlay.add_message(
+                msg_id, timestamp, original_text, source_lang, asr_ms
+            )
+
+        self._last_original = original_text
+        self._last_msg_id = msg_id
+
+        target_lang = self._target_language
+        extra_langs = set()
+        if self._subwin and self._subwin.isVisible():
+            subwin_langs = self._subwin.get_target_languages()
+            extra_langs = subwin_langs - {target_lang, source_lang}
+
+        if source_lang == target_lang:
+            log.info(f"Same language ({source_lang}), no translation")
+            if self._overlay:
+                self._overlay.update_translation(msg_id, "", 0)
+                self._overlay.update_stats(
+                    self._asr_count,
+                    self._translate_count,
+                    self._total_prompt_tokens,
+                    self._total_completion_tokens,
+                    self._compute_cost(),
+                )
+            if self._subwin and self._subwin.isVisible():
+                if extra_langs:
+                    try:
+                        self._tl_executor.submit(
+                            self._translate_subwin_only,
+                            original_text,
+                            source_lang,
+                            extra_langs,
+                        )
+                    except RuntimeError:
+                        pass
+                else:
+                    self._subwin.update_text(original_text, {target_lang: original_text})
+            return
+
+        try:
+            self._tl_executor.submit(
+                self._translate_async, msg_id, original_text, source_lang,
+                extra_langs or None,
+            )
+        except RuntimeError:
+            log.warning("Translation executor shut down, skipping")
 
     def _translate_async(self, msg_id, text, source_lang, extra_langs=None):
         """Translate text and update UI with streaming display."""
@@ -621,101 +779,25 @@ class LiveTranslateApp:
         log.info(f"Speech segment: {seg_len:.1f}s")
 
         asr_start = time.perf_counter()
-        with self._asr_lock:
-            if not self._asr_ready or self._asr is None:
-                return
-            try:
-                result = self._asr.transcribe(speech_segment)
-            except Exception as e:
-                log.error(f"ASR error: {e}", exc_info=True)
-                return
+        result = self._transcribe_audio(speech_segment)
         asr_ms = (time.perf_counter() - asr_start) * 1000
         if asr_ms > 10000:
             log.warning(f"ASR took {asr_ms:.0f}ms, possible hang")
         if result is None:
             return
 
-        original_text = result["text"].strip()
-        # Skip empty or punctuation-only ASR results
-        if not original_text or not any(c.isalnum() for c in original_text):
-            log.debug(
-                f"ASR returned empty/punctuation-only, skipping: '{result['text']}'"
-            )
+        segment = self._build_committed_segment(
+            result.text,
+            result.language,
+            asr_ms=asr_ms,
+            seg_len=seg_len,
+            from_preview=False,
+        )
+        if segment is None:
             return
+        self._emit_committed_segment(segment)
 
-        # Skip suspiciously short text from long segments (likely noise)
-        alnum_chars = sum(1 for c in original_text if c.isalnum())
-        if seg_len >= 2.0 and alnum_chars <= 3:
-            log.debug(
-                f"Noise filter: {seg_len:.1f}s segment produced only '{original_text}', skipping"
-            )
-            return
-
-        source_lang = result["language"]
-        asr_lang_setting = self._panel.get_settings().get("asr_language", "auto") if self._panel else "auto"
-        if asr_lang_setting != "auto" and source_lang != asr_lang_setting:
-            log.info(
-                f"Language filter: expected '{asr_lang_setting}' but got '{source_lang}', "
-                f"discarding: {original_text[:60]}"
-            )
-            return
-
-        self._asr_count += 1
-        self._msg_id += 1
-        msg_id = self._msg_id
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log.info(f"ASR [{source_lang}] ({asr_ms:.0f}ms): {original_text}")
-
-        if self._overlay:
-            self._overlay.add_message(
-                msg_id, timestamp, original_text, source_lang, asr_ms
-            )
-
-        # Store for subtitle window (translation will be added later)
-        self._last_original = original_text
-        self._last_msg_id = msg_id
-
-        target_lang = self._target_language
-
-        # Collect extra languages needed by subtitle window (beyond the primary target)
-        extra_langs = set()
-        if self._subwin and self._subwin.isVisible():
-            subwin_langs = self._subwin.get_target_languages()
-            # Remove primary target and source (no need to translate those)
-            extra_langs = subwin_langs - {target_lang, source_lang}
-
-        if source_lang == target_lang:
-            log.info(f"Same language ({source_lang}), no translation")
-            if self._overlay:
-                self._overlay.update_translation(msg_id, "", 0)
-                self._overlay.update_stats(
-                    self._asr_count,
-                    self._translate_count,
-                    self._total_prompt_tokens,
-                    self._total_completion_tokens,
-                    self._compute_cost(),
-                )
-            if self._subwin and self._subwin.isVisible():
-                # Primary is same language; still need to translate extra langs
-                if extra_langs:
-                    try:
-                        self._tl_executor.submit(
-                            self._translate_subwin_only, original_text, source_lang, extra_langs
-                        )
-                    except RuntimeError:
-                        pass
-                else:
-                    self._subwin.update_text(original_text, {target_lang: original_text})
-        else:
-            try:
-                self._tl_executor.submit(
-                    self._translate_async, msg_id, original_text, source_lang,
-                    extra_langs or None,
-                )
-            except RuntimeError:
-                log.warning("Translation executor shut down, skipping")
-
-    # ── Incremental ASR ──
+    # 鈹€鈹€ Incremental ASR 鈹€鈹€
 
     _pysbd_cache = {}  # lang -> pysbd.Segmenter
 
@@ -736,12 +818,12 @@ class LiveTranslateApp:
         if len(parts) > 1:
             return parts
 
-        # Comma fallback for long unsplit text — split at last balanced comma
-        # CJK 「、」at 25 chars; all commas at 60 chars (long sentence, reduce latency)
-        min_len = 25 if any(c == '、' for c in text) else 60
+        # Comma fallback for long unsplit text 鈥?split at last balanced comma
+        # CJK 銆屻€併€峚t 25 chars; all commas at 60 chars (long sentence, reduce latency)
+        min_len = 25 if any(c == '。' for c in text) else 60
         if len(text) > min_len:
             for i in range(len(text) - 8, 5, -1):
-                if text[i] in ',，;；、':
+                if text[i] in ',，；、':
                     before = text[:i + 1].strip()
                     after = text[i + 1:].strip()
                     if before and after and len(before) > 15 and len(after) > 3:
@@ -751,7 +833,7 @@ class LiveTranslateApp:
 
     @staticmethod
     def _is_short_utterance(text: str) -> bool:
-        """Check if text has ≤8 alphanumeric chars (likely noise/filler/fragment)."""
+        """Check if text has 鈮? alphanumeric chars (likely noise/filler/fragment)."""
         alnum = sum(1 for c in text if c.isalnum())
         return alnum <= 8
 
@@ -788,20 +870,13 @@ class LiveTranslateApp:
         use_word_ts = self._asr_type == "whisper"
 
         asr_start = time.perf_counter()
-        with self._asr_lock:
-            if not self._asr_ready or self._asr is None:
-                return False
-            try:
-                result = self._asr.transcribe(audio, word_timestamps=use_word_ts) if use_word_ts else self._asr.transcribe(audio)
-            except Exception as e:
-                log.error(f"Interim ASR error: {e}", exc_info=True)
-                return False
+        result = self._transcribe_audio(audio, use_word_timestamps=use_word_ts)
         asr_ms = (time.perf_counter() - asr_start) * 1000
 
         if result is None:
             return False
 
-        full_text = result["text"].strip()
+        full_text = result.text.strip()
         if not full_text or not any(c.isalnum() for c in full_text):
             return False
 
@@ -811,11 +886,11 @@ class LiveTranslateApp:
             return False
 
         split_start = time.perf_counter()
-        sentences = self._split_sentences(full_text, result["language"])
+        sentences = self._split_sentences(full_text, result.language)
         split_ms = (time.perf_counter() - split_start) * 1000
         if len(sentences) <= 1:
             return False
-        log.debug(f"Interim split [{result['language']}] ({split_ms:.1f}ms): {len(sentences)} parts -> {sentences}")
+        log.debug(f"Interim split [{result.language}] ({split_ms:.1f}ms): {len(sentences)} parts -> {sentences}")
 
         # All but last are complete; last is still being spoken
         complete = sentences[:-1]
@@ -829,34 +904,30 @@ class LiveTranslateApp:
 
         # Determine trim point
         total_samples = len(audio)
-        if use_word_ts and result.get("words"):
-            words = result["words"]
+        if use_word_ts and result.words:
+            words = result.words
             committed_lower = committed_text.lower().rstrip()
             char_pos = 0
             last_word_end = 0.0
             for w in words:
-                word_text = w["word"].strip()
+                word_text = str(w["word"]).strip()
                 idx = committed_lower.find(word_text.lower(), char_pos)
                 if idx >= 0:
                     char_pos = idx + len(word_text)
-                    last_word_end = w["end"]
+                    last_word_end = float(w["end"])
                 if char_pos >= len(committed_lower):
                     break
             trim_samples = int(last_word_end * 16000)
         else:
-            # Proportional trim with safety margin to reduce echo
             ratio = len(committed_text) / max(len(full_text), 1)
-            margin = int(0.3 * 16000)  # 0.3s extra trim to avoid re-recognition
+            margin = int(0.3 * 16000)
             trim_samples = int(ratio * total_samples) + margin
-            # Don't over-trim: keep at least 0.5s for the remaining sentence
             max_trim = total_samples - int(0.5 * 16000)
             trim_samples = min(trim_samples, max(max_trim, 0))
-            # Minimum trim to prevent re-recognition loops
             min_trim = int(0.3 * 16000)
             if trim_samples < min_trim and trim_samples > 0:
                 trim_samples = min(min_trim, total_samples // 2)
 
-        # Output committed sentences
         actually_committed = False
         for sent in complete:
             text = sent.strip()
@@ -871,7 +942,15 @@ class LiveTranslateApp:
                 text = self._interim_pending + text
                 self._interim_pending = ""
 
-            self._process_segment_text(text, result["language"], asr_ms)
+            segment = self._build_committed_segment(
+                text,
+                result.language,
+                asr_ms=asr_ms,
+                from_preview=True,
+            )
+            if segment is None:
+                continue
+            self._emit_committed_segment(segment)
             actually_committed = True
 
         if not actually_committed:
@@ -881,7 +960,6 @@ class LiveTranslateApp:
             with self._vad_lock:
                 self._vad.trim_front(trim_samples)
 
-        # Track committed text tail for echo dedup
         self._interim_committed_tail = committed_text[-50:] if len(committed_text) > 50 else committed_text
 
         self._interim_active = True
@@ -889,52 +967,16 @@ class LiveTranslateApp:
         return True
 
     def _process_segment_text(self, text: str, source_lang: str, asr_ms: float = 0):
-        """Output a text result (from interim or final) — similar to _process_segment but skips ASR."""
-        original_text = text.strip()
-        if not original_text or not any(c.isalnum() for c in original_text):
+        """Output a text result (from interim or final) - similar to _process_segment but skips ASR."""
+        segment = self._build_committed_segment(
+            text,
+            source_lang,
+            asr_ms=asr_ms,
+            from_preview=True,
+        )
+        if segment is None:
             return
-
-        asr_lang_setting = self._panel.get_settings().get("asr_language", "auto") if self._panel else "auto"
-        if asr_lang_setting != "auto" and source_lang != asr_lang_setting:
-            log.info(f"Language filter: expected '{asr_lang_setting}' but got '{source_lang}', discarding: {original_text[:60]}")
-            return
-
-        self._asr_count += 1
-        self._msg_id += 1
-        msg_id = self._msg_id
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log.info(f"ASR [{source_lang}] ({asr_ms:.0f}ms, interim): {original_text}")
-
-        if self._overlay:
-            self._overlay.add_message(msg_id, timestamp, original_text, source_lang, asr_ms)
-
-        self._last_original = original_text
-        self._last_msg_id = msg_id
-
-        target_lang = self._target_language
-        extra_langs = set()
-        if self._subwin and self._subwin.isVisible():
-            subwin_langs = self._subwin.get_target_languages()
-            extra_langs = subwin_langs - {target_lang, source_lang}
-
-        if source_lang == target_lang:
-            log.info(f"Same language ({source_lang}), no translation")
-            if self._overlay:
-                self._overlay.update_translation(msg_id, "", 0)
-                self._overlay.update_stats(self._asr_count, self._translate_count, self._total_prompt_tokens, self._total_completion_tokens, self._compute_cost())
-            if self._subwin and self._subwin.isVisible():
-                if extra_langs:
-                    try:
-                        self._tl_executor.submit(self._translate_subwin_only, original_text, source_lang, extra_langs)
-                    except RuntimeError:
-                        pass
-                else:
-                    self._subwin.update_text(original_text, {target_lang: original_text})
-        else:
-            try:
-                self._tl_executor.submit(self._translate_async, msg_id, original_text, source_lang, extra_langs or None)
-            except RuntimeError:
-                log.warning("Translation executor shut down, skipping")
+        self._emit_committed_segment(segment)
 
     def _process_interim_final(self, speech_segment):
         """Handle VAD flush after interim outputs were already made."""
@@ -942,18 +984,10 @@ class LiveTranslateApp:
         log.info(f"Interim final segment: {seg_len:.1f}s")
 
         asr_start = time.perf_counter()
-        with self._asr_lock:
-            if not self._asr_ready or self._asr is None:
-                return
-            try:
-                result = self._asr.transcribe(speech_segment)
-            except Exception as e:
-                log.error(f"Interim final ASR error: {e}", exc_info=True)
-                return
+        result = self._transcribe_audio(speech_segment)
         asr_ms = (time.perf_counter() - asr_start) * 1000
 
         if result is None:
-            # Flush any remaining pending
             if self._interim_pending:
                 text = self._interim_pending
                 self._interim_pending = ""
@@ -963,12 +997,9 @@ class LiveTranslateApp:
                 self._process_segment_text(text, lang)
             return
 
-        original_text = result["text"].strip()
-
-        # Strip echo from previous commit's overlap
+        original_text = result.text.strip()
         original_text = self._strip_committed_overlap(original_text)
 
-        # Prepend any remaining pending short utterances
         if self._interim_pending:
             original_text = self._interim_pending + original_text
             self._interim_pending = ""
@@ -976,13 +1007,16 @@ class LiveTranslateApp:
         if not original_text or not any(c.isalnum() for c in original_text):
             return
 
-        # Apply noise filter like _process_segment
-        alnum_chars = sum(1 for c in original_text if c.isalnum())
-        if seg_len >= 2.0 and alnum_chars <= 3:
-            log.debug(f"Noise filter: {seg_len:.1f}s segment produced only '{original_text}', skipping")
+        segment = self._build_committed_segment(
+            original_text,
+            result.language,
+            asr_ms=asr_ms,
+            seg_len=seg_len,
+            from_preview=False,
+        )
+        if segment is None:
             return
-
-        self._process_segment_text(original_text, result["language"], asr_ms)
+        self._emit_committed_segment(segment)
 
     def _capture_loop(self):
         silence_chunk = np.zeros(
@@ -1019,7 +1053,7 @@ class LiveTranslateApp:
                 speech_segment = self._vad.process_chunk(chunk)
 
             if speech_segment is None:
-                # Still accumulating — check for interim ASR
+                # Still accumulating 鈥?check for interim ASR
                 if (self._incremental_enabled and self._asr_ready
                         and self._vad._is_speaking):
                     buf_samples = self._vad._speech_samples
@@ -1118,7 +1152,7 @@ def main():
     _app_icon = create_app_icon()
     app.setWindowIcon(_app_icon)
 
-    # First launch → setup wizard (hub + download) → configure translation API
+    # First launch 鈫?setup wizard (hub + download) 鈫?configure translation API
     if not SETTINGS_FILE.exists():
         wizard = SetupWizardDialog()
         if wizard.exec() != QDialog.DialogCode.Accepted:
@@ -1152,7 +1186,7 @@ def main():
                 log.info(f"Translation API configured: {data['name']}")
         # If user skips, ControlPanel will create default placeholder from config.yaml
 
-    # Non-first launch but models missing → download dialog
+    # Non-first launch but models missing 鈫?download dialog
     else:
         missing = get_missing_models(
             saved.get("asr_engine", "sensevoice"),
@@ -1409,7 +1443,7 @@ def main():
     autoscroll_action.setChecked(True)
     taskbar_action = QAction(t("taskbar"), checkable=True)
 
-    # Tray → overlay sync
+    # Tray 鈫?overlay sync
     ct_action.toggled.connect(lambda v: overlay._handle._ct_check.setChecked(v))
     topmost_action.toggled.connect(
         lambda v: overlay._handle._topmost_check.setChecked(v)
@@ -1421,7 +1455,7 @@ def main():
         lambda v: overlay._handle._taskbar_check.setChecked(v)
     )
 
-    # Overlay → tray sync
+    # Overlay 鈫?tray sync
     overlay._handle.click_through_toggled.connect(lambda v: ct_action.setChecked(v))
     overlay._handle.topmost_toggled.connect(lambda v: topmost_action.setChecked(v))
     overlay._handle.auto_scroll_toggled.connect(
@@ -1520,7 +1554,7 @@ def main():
         panel._current_settings["target_language"] = lang_code
         _save_settings(settings)
 
-    # Overlay → tray lang sync
+    # Overlay 鈫?tray lang sync
     def _on_overlay_lang_changed(lang_code):
         if lang_code in _lang_actions:
             _lang_actions[lang_code].setChecked(True)
@@ -1587,12 +1621,12 @@ def main():
     overlay.target_language_changed.connect(live_trans._on_target_language_changed)
 
     def _on_overlay_source_lang(code):
-        """Overlay source language combo → sync to panel + ASR engine + tray."""
+        """Overlay source language combo 鈫?sync to panel + ASR engine + tray."""
         _on_tray_asr_lang(code)
         overlay.set_source_language(code)
 
     def _on_panel_asr_lang_changed(_index):
-        """Panel ASR language combo → sync to overlay."""
+        """Panel ASR language combo 鈫?sync to overlay."""
         code = panel._asr_lang.currentData() or "auto"
         overlay.set_source_language(code)
 
@@ -1619,3 +1653,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
