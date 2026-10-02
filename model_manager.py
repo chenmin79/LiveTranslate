@@ -20,6 +20,7 @@ ASR_DISPLAY_NAMES = {
     "funasr-mlt-nano": "Fun-ASR-MLT-Nano",
     "whisper": "Whisper",
     "qwen3-asr": "Qwen3-ASR",
+    "voxtral-mini-4b-realtime-2602-gguf": "Voxtral Mini 4B Realtime",
 }
 
 # Expected model files for Qwen3-ASR

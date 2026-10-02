@@ -1,4 +1,4 @@
-﻿"""
+"""
 LiveTranslate - Phase 0 Prototype
 Real-time audio translation using WASAPI loopback + faster-whisper + LLM.
 """
@@ -412,6 +412,10 @@ class LiveTranslateApp:
                     from asr_sensevoice import SenseVoiceEngine
 
                     new_asr[0] = SenseVoiceEngine(device=device, hub=hub)
+                elif engine_type == "voxtral-mini-4b-realtime-2602-gguf":
+                    from asr_voxtral import VoxtralASREngine
+
+                    new_asr[0] = VoxtralASREngine(device=device)
                 elif engine_type in ("funasr-nano", "funasr-mlt-nano"):
                     from asr_funasr_nano import FunASRNanoEngine
 

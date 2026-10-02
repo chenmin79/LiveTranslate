@@ -152,7 +152,7 @@ class ControlPanel(QWidget):
         # Fit initial height based on whisper group visibility
         QTimer.singleShot(0, lambda: self.resize(self.width(), self.sizeHint().height() + 20))
 
-    # ── VAD / ASR Tab ──
+    # 闂佸啿鍘滈崑鎾绘煃閸忓浜?VAD / ASR Tab 闂佸啿鍘滈崑鎾绘煃閸忓浜?
 
     def _create_vad_tab(self):
         widget = QWidget()
@@ -173,6 +173,7 @@ class ControlPanel(QWidget):
                 "Fun-ASR-Nano (FunASR)",
                 "Fun-ASR-MLT-Nano (FunASR, 31 langs)",
                 "Qwen3-ASR (GGUF, 30 langs)",
+                "Voxtral-Mini-4B-Realtime-2602-GGUF (OpenAI Audio API)",
             ]
         )
         engine_map_idx = {
@@ -181,6 +182,7 @@ class ControlPanel(QWidget):
             "funasr-nano": 2,
             "funasr-mlt-nano": 3,
             "qwen3-asr": 4,
+            "voxtral-mini-4b-realtime-2602-gguf": 5,
         }
         engine_idx = engine_map_idx.get(s.get("asr_engine"), 0)
         self._asr_engine.setCurrentIndex(engine_idx)
@@ -276,7 +278,7 @@ class ControlPanel(QWidget):
         self._hub_combo.currentIndexChanged.connect(self._auto_save)
 
         self._ui_lang_combo = QComboBox()
-        self._ui_lang_combo.addItems(["English", "中文"])
+        self._ui_lang_combo.addItems(["English", "Chinese"])
         from i18n import get_lang
 
         saved_lang = s.get("ui_lang", get_lang())
@@ -287,7 +289,7 @@ class ControlPanel(QWidget):
 
         layout.addWidget(asr_group)
 
-        # Whisper model download — only visible when engine is Whisper
+        # Whisper model download 闂?only visible when engine is Whisper
         self._whisper_group = QGroupBox(t("group_download_whisper"))
         whisper_layout = QHBoxLayout(self._whisper_group)
         self._whisper_size_combo = QComboBox()
@@ -428,7 +430,7 @@ class ControlPanel(QWidget):
         layout.addStretch()
         return widget
 
-    # ── Translation Tab ──
+    # 闂佸啿鍘滈崑鎾绘煃閸忓浜?Translation Tab 闂佸啿鍘滈崑鎾绘煃閸忓浜?
 
     def _create_translation_tab(self):
         widget = QWidget()
@@ -519,7 +521,7 @@ class ControlPanel(QWidget):
         layout.addStretch()
         return widget
 
-    # ── Style Tab ──
+    # 闂佸啿鍘滈崑鎾绘煃閸忓浜?Style Tab 闂佸啿鍘滈崑鎾绘煃閸忓浜?
 
     def _create_style_tab(self):
         from subtitle_overlay import DEFAULT_STYLE
@@ -834,7 +836,7 @@ class ControlPanel(QWidget):
         ):
             w.blockSignals(block)
 
-    # ── Subtitle Tab ──
+    # 闂佸啿鍘滈崑鎾绘煃閸忓浜?Subtitle Tab 闂佸啿鍘滈崑鎾绘煃閸忓浜?
 
     def _create_subtitle_tab(self):
         subtitle_settings = self._current_settings.get("subtitle_mode") or {}
@@ -851,7 +853,7 @@ class ControlPanel(QWidget):
         self._current_settings["subtitle_mode"] = s
         self._subtitle_widget.update_settings(s)
 
-    # ── Benchmark Tab ──
+    # 闂佸啿鍘滈崑鎾绘煃閸忓浜?Benchmark Tab 闂佸啿鍘滈崑鎾绘煃閸忓浜?
 
     def _create_benchmark_tab(self):
         widget = QWidget()
@@ -883,7 +885,7 @@ class ControlPanel(QWidget):
 
         return widget
 
-    # ── Cache Tab ──
+    # 闂佸啿鍘滈崑鎾绘煃閸忓浜?Cache Tab 闂佸啿鍘滈崑鎾绘煃閸忓浜?
 
     def _create_changelog_tab(self):
         from dialogs import _load_latest_changelog
@@ -953,7 +955,7 @@ class ControlPanel(QWidget):
         total = 0
         for name, path, size in results:
             total += size
-            self._cache_list.addItem(f"{name}  —  {format_size(size)}")
+            self._cache_list.addItem(f"{name}  闂? {format_size(size)}")
         if not results:
             self._cache_list.addItem(t("no_cached_models"))
         self._cache_total.setText(
@@ -1044,7 +1046,7 @@ class ControlPanel(QWidget):
             # Switch to Whisper engine with the downloaded size
             self._auto_save()
 
-    # ── Model Management ──
+    # 闂佸啿鍘滈崑鎾绘煃閸忓浜?Model Management 闂佸啿鍘滈崑鎾绘煃閸忓浜?
 
     def _refresh_model_list(self):
         self._model_list.clear()
@@ -1163,7 +1165,7 @@ class ControlPanel(QWidget):
         else:
             self._bench_output.append(text)
 
-    # ── Shared logic ──
+    # 闂佸啿鍘滈崑鎾绘煃閸忓浜?Shared logic 闂佸啿鍘滈崑鎾绘煃閸忓浜?
 
     def _on_silence_mode_changed(self, index):
         self._silence_duration.setEnabled(index == 1)
@@ -1207,9 +1209,8 @@ class ControlPanel(QWidget):
 
         QMessageBox.information(
             self,
-            "LiveTranslate",
+            "Language changed. Please restart the application.\nPlease restart the application to apply the new UI language.",
             "Language changed. Please restart the application.\n"
-            "语言已更改，请重启应用程序。",
         )
 
     def _auto_save(self):
@@ -1256,6 +1257,7 @@ class ControlPanel(QWidget):
             2: "funasr-nano",
             3: "funasr-mlt-nano",
             4: "qwen3-asr",
+            5: "voxtral-mini-4b-realtime-2602-gguf",
         }
         self._current_settings["asr_engine"] = engine_map[
             self._asr_engine.currentIndex()
