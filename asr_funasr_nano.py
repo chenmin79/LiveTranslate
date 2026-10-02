@@ -5,6 +5,7 @@ import tempfile
 import wave
 import re
 import numpy as np
+import torch
 
 log = logging.getLogger("LiveTranslate.FunASR-Nano")
 
@@ -23,14 +24,21 @@ class FunASRNanoEngine:
         import model as _nano_model  # noqa: F401
 
         from funasr import AutoModel
-        from model_manager import ASR_MODEL_IDS, get_local_model_path
+        from model_manager import (
+            ASR_MODEL_IDS,
+            ensure_qwen_weights,
+            get_local_model_path,
+            neutralize_funasr_requirements,
+        )
 
         model_name = ASR_MODEL_IDS[engine_type]
         local = get_local_model_path(engine_type, hub=hub)
         model = local or model_name
 
         if local:
-            self._ensure_qwen_weights(local)
+            # Safety net; the download flow normally fetches these up-front.
+            ensure_qwen_weights(local, hub=hub)
+            neutralize_funasr_requirements(local)
 
         prev_cwd = os.getcwd()
         if local:
@@ -47,23 +55,6 @@ class FunASRNanoEngine:
             os.chdir(prev_cwd)
         self.language = None
         log.info(f"{engine_type} loaded: {model_name} on {device} (hub={hub})")
-
-    @staticmethod
-    def _ensure_qwen_weights(model_dir: str):
-        qwen_dir = os.path.join(model_dir, "Qwen3-0.6B")
-        if not os.path.isdir(qwen_dir):
-            return
-        if any(f.endswith((".safetensors", ".bin")) for f in os.listdir(qwen_dir)):
-            return
-        log.info("Downloading Qwen3-0.6B weights (one-time)...")
-        from huggingface_hub import snapshot_download
-
-        snapshot_download(
-            "Qwen/Qwen3-0.6B",
-            local_dir=qwen_dir,
-            ignore_patterns=["*.gguf"],
-        )
-        log.info("Qwen3-0.6B weights downloaded")
 
     def set_language(self, language: str):
         old = self.language
@@ -97,7 +88,8 @@ class FunASRNanoEngine:
             if self.language:
                 kwargs["language"] = self.language
 
-            result = self._model.generate(**kwargs)
+            with torch.inference_mode():
+                result = self._model.generate(**kwargs)
         finally:
             try:
                 os.unlink(tmp)
@@ -107,8 +99,8 @@ class FunASRNanoEngine:
         if not result or not result[0].get("text"):
             return None
 
-        raw_text = result[0]["text"]
-        text = result[0].get("text_tn", raw_text) or raw_text
+        # "text" keeps punctuation; "text_tn" strips it all via regex
+        text = result[0]["text"]
 
         # Clean special tags
         text = re.sub(r"<\|[^|]+\|>", "", text).strip()
@@ -118,7 +110,7 @@ class FunASRNanoEngine:
 
         detected_lang = self.language or self._guess_language(text)
 
-        log.debug(f"Raw: {raw_text} | ITN: {text}")
+        log.debug(f"ASR: {text}")
         return {
             "text": text,
             "language": detected_lang,

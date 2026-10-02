@@ -28,11 +28,20 @@ class VADProcessor:
         self._chunk_duration = chunk_duration
         self.mode = "silero"  # "silero", "energy", "disabled"
 
-        self._model, self._utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            trust_repo=True,
-        )
+        # Silero v5 ships its model inside the `silero-vad` PyPI package, so load
+        # it from there (zero network). Only fall back to the torch.hub cache
+        # (pinned branch -> offline when already cached) if the package is
+        # missing, since torch.hub otherwise probes/downloads from GitHub.
+        try:
+            from silero_vad import load_silero_vad
+        except ImportError:
+            self._model, _ = torch.hub.load(
+                repo_or_dir="snakers4/silero-vad:master",
+                model="silero_vad",
+                trust_repo=True,
+            )
+        else:
+            self._model = load_silero_vad()
         self._model.eval()
 
         self._speech_buffer = []
@@ -117,8 +126,9 @@ class VADProcessor:
         chunk = audio_chunk[:window_size]
         if len(chunk) < window_size:
             chunk = np.pad(chunk, (0, window_size - len(chunk)))
-        tensor = torch.from_numpy(chunk).float()
-        return self._model(tensor, self.sample_rate).item()
+        with torch.inference_mode():
+            tensor = torch.from_numpy(chunk).float()
+            return float(self._model(tensor, self.sample_rate).item())
 
     def _energy_confidence(self, audio_chunk: np.ndarray) -> float:
         rms = float(np.sqrt(np.mean(audio_chunk**2)))

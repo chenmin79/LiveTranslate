@@ -21,7 +21,8 @@ Windows 实时音频翻译工具。捕获系统音频（WASAPI loopback）和可
 ## 功能特性
 
 - **实时翻译管线**：系统音频 → VAD → ASR → LLM 翻译 → 字幕显示
-- **多 ASR 引擎**：faster-whisper、SenseVoice、FunASR Nano、Qwen3-ASR（GGUF）
+- **多 ASR 引擎**：faster-whisper、SenseVoice、FunASR Nano、Anime-Whisper
+- **远程 ASR**：通过 HTTP 把语音识别放到 GPU 机器上跑 —— 见 [REMOTE_ASR.md](REMOTE_ASR.md)
 - **兼容任意 OpenAI 格式 API**：DeepSeek、Grok、Qwen、GPT、Ollama、vLLM 等
 - **流式翻译显示**：翻译结果逐字实时显示
 - **模型独立配置**：流式传输、结构化输出(JSON)、上下文历史、禁用思考
@@ -39,11 +40,17 @@ Windows 实时音频翻译工具。捕获系统音频（WASAPI loopback）和可
 ## 系统要求
 
 - **操作系统**：Windows 10/11
-- **Python**：3.10+
+- **Python**：3.10–3.12（绿色版免装）
 - **GPU**（推荐）：NVIDIA 显卡 + CUDA 12.6（RTX 50 系列等 Blackwell 架构需要 CUDA 12.8）
 - **网络**：需要访问翻译 API
 
 ## 快速开始
+
+### 绿色版（免装 Python，推荐新手）
+
+从 [Releases](https://github.com/TheDeathDragon/LiveTranslate/releases) 下载 `LiveTranslate-portable-*.zip`，解压后双击 **`start.bat`** 即可。首次运行会自动下载便携版 Python 3.12 并按显卡安装依赖，无需预装任何 Python。
+
+### 从源码安装
 
 ```bash
 git clone https://github.com/TheDeathDragon/LiveTranslate.git
@@ -51,7 +58,7 @@ cd LiveTranslate
 ```
 
 双击 **`install.bat`** 一键安装——脚本会自动：
-1. 检测 Python 3.10+（未安装则通过 winget 自动安装）
+1. 检测 Python 3.10–3.12（未安装则通过 winget 自动安装）
 2. 创建虚拟环境
 3. 检测 NVIDIA 显卡，选择 CUDA / CPU 版 PyTorch
 4. 安装全部依赖
@@ -74,13 +81,10 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu   
 
 # 依赖
 pip install -r requirements.txt
-pip install funasr --no-deps
 
 # 启动
 .venv\Scripts\python.exe main.py
 ```
-
-> FunASR 使用 `--no-deps` 安装，因为 `editdistance` 需要 C++ 编译器。`requirements.txt` 中已包含纯 Python 替代品 `editdistance-s`。
 
 </details>
 
@@ -113,9 +117,11 @@ main.py                 主入口，管线编排
 ├── audio_capture.py    WASAPI loopback + 麦克风混音
 ├── vad_processor.py    Silero VAD
 ├── asr_engine.py       faster-whisper 后端
+├── asr_funasr.py       统一 FunASR 模型选择后端
 ├── asr_sensevoice.py   SenseVoice 后端
 ├── asr_funasr_nano.py  FunASR Nano 后端
-├── asr_qwen3.py        Qwen3-ASR 后端 (ONNX + GGUF)
+├── asr_anime_whisper.py Anime-Whisper 后端 (日语动画/Galgame)
+├── asr_remote.py        远程 Whisper 客户端 (→ asr_server.py, 见 REMOTE_ASR.md)
 ├── translator.py       OpenAI 兼容翻译客户端 (流式/JSON/上下文)
 ├── model_manager.py    模型下载与缓存管理
 ├── subtitle_overlay.py PyQt6 透明悬浮窗
@@ -126,9 +132,10 @@ main.py                 主入口，管线编排
 
 ## 致谢
 
-- [CapsWriter-Offline](https://github.com/HaujetZhao/CapsWriter-Offline) — Qwen3-ASR 集成架构参考
-- [Qwen3-ASR-GGUF](https://github.com/HaujetZhao/Qwen3-ASR-GGUF) — ONNX + GGUF 混合推理引擎
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) — GGUF 模型推理运行时
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — 基于 CTranslate2 的 Whisper 推理
+- [FunASR](https://github.com/modelscope/FunASR) — SenseVoice / Fun-ASR-Nano
+- [Anime-Whisper](https://huggingface.co/litagin/anime-whisper) — 日语动画/Galgame 专用 ASR
+- [Silero VAD](https://github.com/snakers4/silero-vad) — 语音活动检测
 
 ## Star History
 

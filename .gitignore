@@ -1,9 +1,15 @@
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 .venv/
+.pip-cache/
+.uv-cache/
+.tmp/
 models/
 logs/
+docs/
+transcripts/
 user_settings.json
 
 # IDE
@@ -17,12 +23,8 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-# Qwen3-ASR runtime binaries (auto-downloaded)
-qwen_asr_gguf/inference/bin/*.dll
-qwen_asr_gguf/inference/bin/*.so
-qwen_asr_gguf/inference/bin/*.dylib
-
 # Distribution
 dist/
 build/
+release/
 *.egg-info/

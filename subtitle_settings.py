@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from dialogs import available_screen_height, make_scroll_area
 from i18n import t, LANGUAGES
 from subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS
 
@@ -439,6 +440,15 @@ class SubtitleSettingsWidget(QWidget):
         self._hide_duration_spin.setValue(self._settings.get("auto_hide_duration", 300))
         self._hide_duration_spin.valueChanged.connect(self._on_change)
         g.addWidget(self._hide_duration_spin, r, 1)
+        r += 1
+
+        g.addWidget(QLabel(t("subwin_click_through")), r, 0)
+        self._click_through_check = QCheckBox(t("subwin_click_through_hint"))
+        self._click_through_check.setChecked(
+            self._settings.get("click_through", False)
+        )
+        self._click_through_check.toggled.connect(self._on_change)
+        g.addWidget(self._click_through_check, r, 1)
 
         self._update_win_bg_controls_state()
         layout.addWidget(win_group)
@@ -611,6 +621,7 @@ class SubtitleSettingsWidget(QWidget):
             "auto_hide_timeout": self._auto_hide_spin.value(),
             "auto_hide_animation": self._hide_anim_combo.currentData() or "fade",
             "auto_hide_duration": self._hide_duration_spin.value(),
+            "click_through": self._click_through_check.isChecked(),
             "lines": self._settings.get("lines", DEFAULT_SUBTITLE_WIN_SETTINGS["lines"]),
         }
         self._settings.update(s)
@@ -632,10 +643,10 @@ class SubtitleSettingsDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         self._widget = SubtitleSettingsWidget(current_settings, self)
         self._widget.settings_changed.connect(self.settings_changed.emit)
-        layout.addWidget(self._widget)
+        layout.addWidget(make_scroll_area(self._widget))
         self.setWindowTitle(t("subwin_settings"))
-        self.setMinimumSize(520, 500)
-        self.resize(560, 640)
+        self.setMinimumSize(520, 400)
+        self.resize(560, min(640, available_screen_height(self)))
 
     def get_settings(self) -> dict:
         return self._widget.get_settings()

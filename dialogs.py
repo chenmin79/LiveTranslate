@@ -1,18 +1,23 @@
+import json
 import logging
 import re
 import sys
 import threading
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
+    QMessageBox,
+    QScrollArea,
     QSpinBox,
     QGroupBox,
     QHBoxLayout,
@@ -21,12 +26,50 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QTextEdit,
     QVBoxLayout,
+    QWidget,
 )
 
 from model_manager import download_asr, download_silero
-from i18n import t
+from i18n import t, get_lang
 
 log = logging.getLogger("LiveTranslate.Dialogs")
+
+
+def available_screen_height(widget: QWidget) -> int:
+    """Usable vertical space on the widget's screen, minus a margin for
+    the title bar and taskbar. Keeps windows fully on-screen at high DPI
+    scaling (issue #39: 150% on FHD leaves only ~688 logical px)."""
+    screen = widget.screen() or QApplication.primaryScreen()
+    if screen is None:
+        return 600
+    return screen.availableGeometry().height() - 60
+
+
+class _ContentSizedScrollArea(QScrollArea):
+    """QScrollArea whose sizeHint tracks the content, bypassing the
+    built-in 36x24 font-height cap, so windows open at their natural
+    size on large screens and only scroll when the screen is small."""
+
+    def sizeHint(self) -> QSize:
+        content = self.widget()
+        if content is None:
+            return super().sizeHint()
+        frame = 2 * self.frameWidth()
+        hint = content.sizeHint() + QSize(frame, frame)
+        hint.setWidth(hint.width() + self.verticalScrollBar().sizeHint().width())
+        return hint
+
+
+def make_scroll_area(content: QWidget) -> QScrollArea:
+    """Wrap content in a borderless vertical scroll area whose sizeHint
+    tracks the content, so windows keep their natural size on large
+    screens but become scrollable instead of overflowing on small ones."""
+    area = _ContentSizedScrollArea()
+    area.setWidget(content)
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    return area
 
 SETTINGS_FILE = None  # set by control_panel on import
 _save_settings = None  # set by control_panel on import
@@ -151,8 +194,32 @@ class SetupWizardDialog(QDialog):
                 t("hub_huggingface_full"),
             ]
         )
+        # Default source by system language: Chinese -> ModelScope, others -> HuggingFace
+        _sys_lang = get_lang()
+        self._hub_combo.setCurrentIndex(0 if _sys_lang == "zh" else 1)
+        log.info(
+            f"Default hub by lang: {_sys_lang} -> "
+            f"{'ms (ModelScope)' if _sys_lang == 'zh' else 'hf (HuggingFace)'}"
+        )
         hub_layout.addWidget(self._hub_combo)
         layout.addWidget(hub_group)
+
+        proxy_group = QGroupBox(t("group_download_proxy"))
+        proxy_form = QFormLayout(proxy_group)
+        self._proxy_mode = QComboBox()
+        self._proxy_mode.addItems(
+            [t("proxy_none"), t("proxy_system"), t("proxy_custom")]
+        )
+        # Default to following the system proxy for model downloads
+        self._proxy_mode.setCurrentIndex(1)
+        self._proxy_mode.currentIndexChanged.connect(self._on_proxy_mode_changed)
+        self._proxy_url = QLineEdit()
+        self._proxy_url.setPlaceholderText("http://127.0.0.1:7890")
+        self._proxy_url.setEnabled(False)
+        self._proxy_url.textEdited.connect(self._reset_countdown)
+        proxy_form.addRow(t("label_proxy"), self._proxy_mode)
+        proxy_form.addRow(t("label_proxy_url"), self._proxy_url)
+        layout.addWidget(proxy_group)
 
         self._download_btn = QPushButton(t("btn_start_download"))
         self._download_btn.clicked.connect(self._start_download)
@@ -172,7 +239,7 @@ class SetupWizardDialog(QDialog):
         self._log_handler = _LogCapture(self._log_signal.emit)
 
         # Auto-start countdown
-        self._countdown = 5
+        self._countdown = 15
         self._auto_timer = QTimer()
         self._auto_timer.setInterval(1000)
         self._auto_timer.timeout.connect(self._tick_countdown)
@@ -187,9 +254,21 @@ class SetupWizardDialog(QDialog):
         )
 
     def _reset_countdown(self):
-        self._countdown = 5
+        self._countdown = 15
         self._auto_timer.start()
         self._update_btn_countdown()
+
+    def _on_proxy_mode_changed(self, index):
+        self._proxy_url.setEnabled(index == 2)
+        self._reset_countdown()
+
+    def _download_proxy(self) -> str:
+        index = self._proxy_mode.currentIndex()
+        if index == 1:
+            return "system"
+        if index == 2:
+            return self._proxy_url.text().strip() or "system"
+        return "none"
 
     def _tick_countdown(self):
         self._countdown -= 1
@@ -210,9 +289,12 @@ class SetupWizardDialog(QDialog):
         self._download_btn.setText(t("btn_start_download"))
         self._download_btn.setEnabled(False)
         self._hub_combo.setEnabled(False)
+        self._proxy_mode.setEnabled(False)
+        self._proxy_url.setEnabled(False)
         self._log_view.show()
 
         hub = "ms" if self._hub_combo.currentIndex() == 0 else "hf"
+        self._proxy = self._download_proxy()
 
         logging.getLogger().addHandler(self._log_handler)
         self._orig_stderr = sys.stderr
@@ -220,7 +302,7 @@ class SetupWizardDialog(QDialog):
 
         self._error = None
         self._download_thread = threading.Thread(
-            target=self._download_worker, args=(hub,), daemon=True
+            target=self._download_worker, args=(hub, self._proxy), daemon=True
         )
         self._download_thread.start()
 
@@ -229,10 +311,10 @@ class SetupWizardDialog(QDialog):
         self._poll_timer.timeout.connect(self._check_done)
         self._poll_timer.start()
 
-    def _download_worker(self, hub):
+    def _download_worker(self, hub, proxy):
         try:
-            download_silero()
-            download_asr("sensevoice", hub=hub)
+            download_silero(proxy=proxy)
+            download_asr("funasr", model_size="sensevoice-small", hub=hub, proxy=proxy)
         except Exception as e:
             self._error = str(e)
             log.error(f"Download failed: {e}", exc_info=True)
@@ -249,6 +331,8 @@ class SetupWizardDialog(QDialog):
             self._download_btn.setEnabled(True)
             self._download_btn.setText(t("btn_retry"))
             self._hub_combo.setEnabled(True)
+            self._proxy_mode.setEnabled(True)
+            self._proxy_url.setEnabled(self._proxy_mode.currentIndex() == 2)
             return
 
         self._append_log(f"\n{t('download_complete')}")
@@ -257,7 +341,9 @@ class SetupWizardDialog(QDialog):
 
         settings = {
             "hub": hub,
-            "asr_engine": "sensevoice",
+            "download_proxy": self._proxy,
+            "asr_engine": "funasr",
+            "funasr_model": "sensevoice-small",
             "vad_mode": "silero",
             "vad_threshold": 0.3,
             "energy_threshold": 0.02,
@@ -277,7 +363,7 @@ class ModelDownloadDialog(QDialog):
 
     _log_signal = pyqtSignal(str)
 
-    def __init__(self, missing_models, hub="ms", parent=None):
+    def __init__(self, missing_models, hub="ms", proxy="system", parent=None):
         super().__init__(parent)
         self.setWindowTitle(t("window_download"))
         self.setMinimumWidth(520)
@@ -311,6 +397,7 @@ class ModelDownloadDialog(QDialog):
 
         self._missing = missing_models
         self._hub = hub
+        self._proxy = proxy
         self._error = None
 
         self._log_signal.connect(self._append_log)
@@ -343,14 +430,27 @@ class ModelDownloadDialog(QDialog):
         try:
             for m in self._missing:
                 if m["type"] == "silero-vad":
-                    download_silero()
-                elif m["type"] in ("sensevoice", "funasr-nano", "funasr-mlt-nano"):
-                    download_asr(m["type"], hub=self._hub)
-                elif m["type"] == "qwen3-asr":
-                    download_asr("qwen3-asr", hub=self._hub)
+                    download_silero(proxy=self._proxy)
+                elif m["type"] in (
+                    "sensevoice",
+                    "funasr-nano",
+                    "funasr-mlt-nano",
+                    "anime-whisper",
+                ):
+                    download_asr(m["type"], hub=self._hub, proxy=self._proxy)
+                elif m["type"].startswith("funasr:"):
+                    model_key = m["type"].split(":", 1)[1]
+                    download_asr(
+                        "funasr",
+                        model_size=model_key,
+                        hub=self._hub,
+                        proxy=self._proxy,
+                    )
                 elif m["type"].startswith("whisper-"):
                     size = m["type"].replace("whisper-", "")
-                    download_asr("whisper", model_size=size, hub=self._hub)
+                    download_asr(
+                        "whisper", model_size=size, hub=self._hub, proxy=self._proxy
+                    )
         except Exception as e:
             self._error = str(e)
             log.error(f"Download failed: {e}", exc_info=True)
@@ -379,9 +479,17 @@ class ModelEditDialog(QDialog):
         self.setWindowTitle(
             t("dialog_edit_model") if model_data else t("dialog_add_model")
         )
-        self.setMinimumWidth(450)
+        self.setMinimumWidth(500)
 
-        layout = QFormLayout(self)
+        root = QVBoxLayout(self)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+
+        # --- Basic section ---
+        basic_group = QGroupBox()
+        basic_group.setFlat(True)
+        layout = QFormLayout(basic_group)
 
         self._name = QLineEdit()
         self._api_base = QLineEdit()
@@ -400,9 +508,10 @@ class ModelEditDialog(QDialog):
 
         self._no_system_role = QCheckBox(t("no_system_role"))
         self._no_system_role.setToolTip(t("no_system_role_hint"))
-        self._no_think = QCheckBox(t("no_think"))
-        self._no_think.setToolTip(t("no_think_hint"))
-        self._no_think.setChecked(True)
+        self._thinking_style = QComboBox()
+        for style_key in ("auto", "deepseek", "qwen", "vllm", "openai", "off"):
+            self._thinking_style.addItem(t(f"thinking_style_{style_key}"), style_key)
+        self._thinking_style.setToolTip(t("thinking_style_hint"))
         self._streaming = QCheckBox(t("streaming"))
         self._streaming.setToolTip(t("streaming_hint"))
         self._streaming.setChecked(True)
@@ -413,7 +522,6 @@ class ModelEditDialog(QDialog):
         self._context_turns.setValue(0)
         self._context_turns.setToolTip(t("context_turns_hint"))
 
-        # Pricing
         price_suffix = t("price_suffix")
         self._input_price = QDoubleSpinBox()
         self._input_price.setRange(0, 999)
@@ -440,11 +548,78 @@ class ModelEditDialog(QDialog):
         layout.addRow(t("label_proxy_url"), self._proxy_url)
         layout.addRow(t("label_pricing"), price_row)
         layout.addRow(t("label_context_turns"), self._context_turns)
+        layout.addRow(t("label_thinking"), self._thinking_style)
         layout.addRow("", self._streaming)
         layout.addRow("", self._json_response)
         layout.addRow("", self._no_system_role)
-        layout.addRow("", self._no_think)
 
+        content_layout.addWidget(basic_group)
+
+        # --- Advanced section ---
+        adv_group = QGroupBox(t("label_advanced_params"))
+        adv_layout = QFormLayout(adv_group)
+        adv_group.setToolTip(t("override_hint"))
+
+        self._adv_temperature = QDoubleSpinBox()
+        self._adv_temperature.setRange(0.0, 2.0)
+        self._adv_temperature.setDecimals(2)
+        self._adv_temperature.setSingleStep(0.1)
+        self._adv_temperature.setValue(0.3)
+
+        self._adv_top_p = QDoubleSpinBox()
+        self._adv_top_p.setRange(0.0, 1.0)
+        self._adv_top_p.setDecimals(2)
+        self._adv_top_p.setSingleStep(0.05)
+        self._adv_top_p.setValue(1.0)
+
+        self._adv_max_tokens = QSpinBox()
+        self._adv_max_tokens.setRange(1, 32768)
+        self._adv_max_tokens.setValue(256)
+
+        self._adv_freq_penalty = QDoubleSpinBox()
+        self._adv_freq_penalty.setRange(-2.0, 2.0)
+        self._adv_freq_penalty.setDecimals(2)
+        self._adv_freq_penalty.setSingleStep(0.1)
+
+        self._adv_presence_penalty = QDoubleSpinBox()
+        self._adv_presence_penalty.setRange(-2.0, 2.0)
+        self._adv_presence_penalty.setDecimals(2)
+        self._adv_presence_penalty.setSingleStep(0.1)
+
+        self._adv_seed = QSpinBox()
+        self._adv_seed.setRange(0, 2_000_000_000)
+
+        self._adv_rows = {
+            "temperature": self._make_override_row(self._adv_temperature),
+            "top_p": self._make_override_row(self._adv_top_p),
+            "max_tokens": self._make_override_row(self._adv_max_tokens),
+            "frequency_penalty": self._make_override_row(self._adv_freq_penalty),
+            "presence_penalty": self._make_override_row(self._adv_presence_penalty),
+            "seed": self._make_override_row(self._adv_seed),
+        }
+        adv_layout.addRow(t("label_temperature"), self._adv_rows["temperature"][1])
+        adv_layout.addRow(t("label_top_p"), self._adv_rows["top_p"][1])
+        adv_layout.addRow(t("label_max_tokens"), self._adv_rows["max_tokens"][1])
+        adv_layout.addRow(
+            t("label_frequency_penalty"), self._adv_rows["frequency_penalty"][1]
+        )
+        adv_layout.addRow(
+            t("label_presence_penalty"), self._adv_rows["presence_penalty"][1]
+        )
+        adv_layout.addRow(t("label_seed"), self._adv_rows["seed"][1])
+
+        self._adv_extra_body = QTextEdit()
+        self._adv_extra_body.setPlaceholderText(
+            '{"thinking": {"type": "disabled"}}'
+        )
+        self._adv_extra_body.setToolTip(t("extra_body_hint"))
+        self._adv_extra_body.setFixedHeight(70)
+        adv_layout.addRow(t("label_extra_body"), self._adv_extra_body)
+
+        content_layout.addWidget(adv_group)
+        root.addWidget(make_scroll_area(content), 1)
+
+        # --- Populate from model_data ---
         if model_data:
             self._name.setText(model_data.get("name", ""))
             self._api_base.setText(model_data.get("api_base", ""))
@@ -459,22 +634,81 @@ class ModelEditDialog(QDialog):
             else:
                 self._proxy_mode.setCurrentIndex(0)
             self._no_system_role.setChecked(model_data.get("no_system_role", False))
-            self._no_think.setChecked(model_data.get("no_think", True))
+            style = model_data.get("thinking_style")
+            if style is None:
+                # Migrate the legacy no_think bool
+                style = "auto" if model_data.get("no_think", True) else "off"
+            style_idx = self._thinking_style.findData(style)
+            if style_idx >= 0:
+                self._thinking_style.setCurrentIndex(style_idx)
             self._streaming.setChecked(model_data.get("streaming", True))
             self._json_response.setChecked(model_data.get("json_response", False))
             self._context_turns.setValue(model_data.get("context_turns", 0))
             self._input_price.setValue(model_data.get("input_price", 0))
             self._output_price.setValue(model_data.get("output_price", 0))
 
+            overrides = model_data.get("overrides") or {}
+            for key, (cb, _row, widget) in self._adv_rows.items():
+                if key in overrides and overrides[key] is not None:
+                    cb.setChecked(True)
+                    if isinstance(widget, QSpinBox):
+                        widget.setValue(int(overrides[key]))
+                    else:
+                        widget.setValue(float(overrides[key]))
+            extra_body = model_data.get("extra_body")
+            if extra_body:
+                try:
+                    self._adv_extra_body.setPlainText(
+                        json.dumps(extra_body, ensure_ascii=False, indent=2)
+                    )
+                except (TypeError, ValueError):
+                    pass
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        root.addWidget(buttons)
+        hint = self.sizeHint()
+        self.resize(hint.width(), min(hint.height(), available_screen_height(self)))
+
+    def _make_override_row(self, widget):
+        """Build a [checkbox + widget] row that disables the widget when unchecked."""
+        cb = QCheckBox(t("override_enable"))
+        widget.setEnabled(False)
+        cb.toggled.connect(widget.setEnabled)
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(cb)
+        h.addWidget(widget, 1)
+        return cb, row, widget
 
     def _on_proxy_mode_changed(self, index):
         self._proxy_url.setEnabled(index == 2)
+
+    def _parse_extra_body(self):
+        """Return (ok, data_or_error_msg). Empty text → (True, None)."""
+        text = self._adv_extra_body.toPlainText().strip()
+        if not text:
+            return True, None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            return False, f"{e}"
+        if not isinstance(data, dict):
+            return False, "extra_body must be a JSON object"
+        return True, data
+
+    def _on_accept(self):
+        ok, _ = self._parse_extra_body()
+        if not ok:
+            QMessageBox.warning(
+                self, t("error_title"), t("extra_body_invalid")
+            )
+            return
+        self.accept()
 
     def get_data(self) -> dict:
         proxy_idx = self._proxy_mode.currentIndex()
@@ -493,8 +727,9 @@ class ModelEditDialog(QDialog):
         }
         if self._no_system_role.isChecked():
             result["no_system_role"] = True
-        if not self._no_think.isChecked():
-            result["no_think"] = False
+        thinking_style = self._thinking_style.currentData()
+        if thinking_style != "auto":
+            result["thinking_style"] = thinking_style
         if not self._streaming.isChecked():
             result["streaming"] = False
         if self._json_response.isChecked():
@@ -505,6 +740,20 @@ class ModelEditDialog(QDialog):
             result["input_price"] = self._input_price.value()
         if self._output_price.value() > 0:
             result["output_price"] = self._output_price.value()
+
+        overrides = {}
+        for key, (cb, _row, widget) in self._adv_rows.items():
+            if cb.isChecked():
+                val = widget.value()
+                if isinstance(widget, QDoubleSpinBox):
+                    val = round(val, 2)
+                overrides[key] = val
+        if overrides:
+            result["overrides"] = overrides
+
+        ok, data = self._parse_extra_body()
+        if ok and data:
+            result["extra_body"] = data
         return result
 
 
@@ -533,7 +782,7 @@ def _changelog_to_html(text: str) -> str:
 
 
 def _load_latest_changelog() -> tuple[str, str]:
-    """Return (first_h3_title, html) for the latest changelog. Uses i18n lang."""
+    """Return (first_h2_title, html) for the latest changelog. Uses i18n lang."""
     from i18n import get_lang
     lang = get_lang()
     path = _I18N_DIR / f"CHANGELOG_{lang}.md"
@@ -542,14 +791,13 @@ def _load_latest_changelog() -> tuple[str, str]:
     if not path.exists():
         return "", ""
     text = path.read_text("utf-8")
-    # Use first ### title as the tracking key
-    m = re.search(r"^### (.+)$", text, re.MULTILINE)
+    # First H2 (## date) is the latest entry and serves as the tracking key
+    m = re.search(r"^## (.+)$", text, re.MULTILINE)
     if not m:
         return "", ""
     title = m.group(1).strip()
-    # Extract everything after the # title line (skip file heading)
-    first_h1 = text.find("\n#")
-    body = text[first_h1:] if first_h1 >= 0 else text
+    # Drop the top-level file heading (# Title) — keep everything from first H2 onwards
+    body = text[m.start():]
     return title, _changelog_to_html(body)
 
 

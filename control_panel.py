@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -31,12 +32,22 @@ from PyQt6.QtWidgets import (
 from benchmark import run_benchmark
 from dialogs import (
     ModelEditDialog,
+    available_screen_height,
+    make_scroll_area,
 )
 from model_manager import (
+    DEFAULT_FUNASR_MODEL,
     MODELS_DIR,
+    _WHISPER_SIZES,
     dir_size,
+    funasr_model_options,
+    funasr_supports_padding,
     format_size,
     get_cache_entries,
+    list_local_faster_whisper_models,
+    migrate_funasr_settings,
+    normalize_funasr_model_key,
+    resolve_custom_whisper_model,
 )
 from i18n import t, LANGUAGES
 from subtitle_settings import SubtitleSettingsWidget
@@ -50,6 +61,7 @@ def _load_saved_settings() -> dict | None:
     try:
         if SETTINGS_FILE.exists():
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            migrate_funasr_settings(data)
             log.info(f"Loaded saved settings from {SETTINGS_FILE}")
             return data
     except Exception as e:
@@ -84,10 +96,10 @@ class ControlPanel(QWidget):
         super().__init__()
         self._config = config
         self.setWindowTitle(t("window_control_panel"))
-        self.setMinimumSize(480, 560)
-        self.resize(520, 650)
+        self.setMinimumSize(480, 420)
+        self.resize(520, min(650, available_screen_height(self)))
 
-        saved = saved_settings or _load_saved_settings()
+        saved = migrate_funasr_settings(saved_settings) or _load_saved_settings()
         if saved:
             self._current_settings = saved
         else:
@@ -101,8 +113,17 @@ class ControlPanel(QWidget):
                 "silence_mode": "auto",
                 "silence_duration": 0.8,
                 "asr_language": config["asr"].get("language", "auto"),
-                "asr_engine": "sensevoice",
+                "asr_engine": "funasr",
+                "funasr_model": config["asr"].get(
+                    "funasr_model", DEFAULT_FUNASR_MODEL
+                ),
                 "asr_device": "cuda",
+                "sensevoice_pad_seconds": config["asr"].get(
+                    "sensevoice_pad_seconds", 0.5
+                ),
+                "whisper_pad_seconds": config["asr"].get(
+                    "whisper_pad_seconds", 0.5
+                ),
                 "models": [
                     {
                         "name": f"{tc['model']}",
@@ -127,15 +148,35 @@ class ControlPanel(QWidget):
             ]
             self._current_settings["active_model"] = 0
 
+        self._current_settings.setdefault(
+            "funasr_model",
+            config["asr"].get("funasr_model", DEFAULT_FUNASR_MODEL),
+        )
+        self._current_settings["funasr_model"] = normalize_funasr_model_key(
+            self._current_settings.get("funasr_model")
+        )
+        self._current_settings.setdefault(
+            "sensevoice_pad_seconds",
+            config["asr"].get("sensevoice_pad_seconds", 0.5),
+        )
+        self._current_settings.setdefault(
+            "whisper_pad_seconds",
+            config["asr"].get("whisper_pad_seconds", 0.5),
+        )
+
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
 
-        tabs.addTab(self._create_vad_tab(), t("tab_vad_asr"))
-        tabs.addTab(self._create_translation_tab(), t("tab_translation"))
-        tabs.addTab(self._create_style_tab(), t("tab_style"))
-        tabs.addTab(self._create_subtitle_tab(), t("tab_subtitle"))
+        tabs.addTab(make_scroll_area(self._create_vad_tab()), t("tab_vad_asr"))
+        tabs.addTab(
+            make_scroll_area(self._create_translation_tab()), t("tab_translation")
+        )
+        tabs.addTab(make_scroll_area(self._create_style_tab()), t("tab_style"))
+        tabs.addTab(make_scroll_area(self._create_subtitle_tab()), t("tab_subtitle"))
         tabs.addTab(self._create_benchmark_tab(), t("tab_benchmark"))
-        self._cache_tab_index = tabs.addTab(self._create_cache_tab(), t("tab_cache"))
+        self._cache_tab_index = tabs.addTab(
+            make_scroll_area(self._create_cache_tab()), t("tab_cache")
+        )
         tabs.addTab(self._create_changelog_tab(), t("tab_changelog"))
         tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -150,7 +191,12 @@ class ControlPanel(QWidget):
         self._save_timer.timeout.connect(self._do_auto_save)
 
         # Fit initial height based on whisper group visibility
-        QTimer.singleShot(0, lambda: self.resize(self.width(), self.sizeHint().height() + 20))
+        QTimer.singleShot(0, self._fit_height)
+
+    def _fit_height(self):
+        """Resize to content height, clamped to the screen (issue #39)."""
+        h = min(self.sizeHint().height() + 20, available_screen_height(self))
+        self.resize(self.width(), max(h, self.minimumHeight()))
 
     # 闂佸啿鍘滈崑鎾绘煃閸忓浜?VAD / ASR Tab 闂佸啿鍘滈崑鎾绘煃閸忓浜?
 
@@ -169,20 +215,18 @@ class ControlPanel(QWidget):
         self._asr_engine.addItems(
             [
                 f"[{t('asr_accurate')}] Whisper (faster-whisper)",
-                f"[{t('asr_fast')}] SenseVoice (FunASR)",
-                "Fun-ASR-Nano (FunASR)",
-                "Fun-ASR-MLT-Nano (FunASR, 31 langs)",
-                "Qwen3-ASR (GGUF, 30 langs)",
+                f"[{t('asr_fast')}] FunASR",
+                "Anime-Whisper (ja, anime/galgame)",
+                "Remote Whisper (remote GPU server)",
                 "Voxtral-Mini-4B-Realtime-2602-GGUF (OpenAI Audio API)",
             ]
         )
         engine_map_idx = {
             "whisper": 0,
-            "sensevoice": 1,
-            "funasr-nano": 2,
-            "funasr-mlt-nano": 3,
-            "qwen3-asr": 4,
-            "voxtral-mini-4b-realtime-2602-gguf": 5,
+            "funasr": 1,
+            "anime-whisper": 2,
+            "remote-whisper": 3,
+            "voxtral-mini-4b-realtime-2602-gguf": 4,
         }
         engine_idx = engine_map_idx.get(s.get("asr_engine"), 0)
         self._asr_engine.setCurrentIndex(engine_idx)
@@ -224,6 +268,56 @@ class ControlPanel(QWidget):
         asr_layout.addWidget(self._asr_device, 2, 1)
         self._asr_device.currentIndexChanged.connect(self._auto_save)
 
+        self._funasr_model_label = QLabel(t("label_funasr_model"))
+        self._funasr_model_combo = QComboBox()
+        for key, display_name in funasr_model_options():
+            self._funasr_model_combo.addItem(display_name, key)
+        saved_funasr_model = normalize_funasr_model_key(
+            s.get("funasr_model", DEFAULT_FUNASR_MODEL)
+        )
+        funasr_idx = self._funasr_model_combo.findData(saved_funasr_model)
+        if funasr_idx >= 0:
+            self._funasr_model_combo.setCurrentIndex(funasr_idx)
+        self._funasr_model_combo.currentIndexChanged.connect(
+            self._on_funasr_model_changed
+        )
+        asr_layout.addWidget(self._funasr_model_label, 3, 0)
+        asr_layout.addWidget(self._funasr_model_combo, 3, 1)
+
+        self._whisper_pad_label = QLabel(t("label_whisper_padding"))
+        self._whisper_pad_seconds = QDoubleSpinBox()
+        self._whisper_pad_seconds.setRange(0.0, 5.0)
+        self._whisper_pad_seconds.setDecimals(2)
+        self._whisper_pad_seconds.setSingleStep(0.1)
+        try:
+            whisper_pad_seconds = float(s.get("whisper_pad_seconds", 0.5))
+        except (TypeError, ValueError):
+            whisper_pad_seconds = 0.5
+        self._whisper_pad_seconds.setValue(whisper_pad_seconds)
+        self._whisper_pad_seconds.setSuffix(" s")
+        self._whisper_pad_seconds.setSpecialValueText(t("whisper_padding_off"))
+        self._whisper_pad_seconds.setToolTip(t("whisper_padding_tooltip"))
+        asr_layout.addWidget(self._whisper_pad_label, 4, 0)
+        asr_layout.addWidget(self._whisper_pad_seconds, 4, 1)
+        self._whisper_pad_seconds.valueChanged.connect(self._auto_save)
+
+        self._sensevoice_pad_label = QLabel(t("label_sensevoice_padding"))
+        self._sensevoice_pad_seconds = QDoubleSpinBox()
+        self._sensevoice_pad_seconds.setRange(0.0, 5.0)
+        self._sensevoice_pad_seconds.setDecimals(2)
+        self._sensevoice_pad_seconds.setSingleStep(0.1)
+        try:
+            sensevoice_pad_seconds = float(s.get("sensevoice_pad_seconds", 0.5))
+        except (TypeError, ValueError):
+            sensevoice_pad_seconds = 0.5
+        self._sensevoice_pad_seconds.setValue(sensevoice_pad_seconds)
+        self._sensevoice_pad_seconds.setSuffix(" s")
+        self._sensevoice_pad_seconds.setSpecialValueText(t("sensevoice_padding_off"))
+        self._sensevoice_pad_seconds.setToolTip(t("sensevoice_padding_tooltip"))
+        asr_layout.addWidget(self._sensevoice_pad_label, 5, 0)
+        asr_layout.addWidget(self._sensevoice_pad_seconds, 5, 1)
+        self._sensevoice_pad_seconds.valueChanged.connect(self._auto_save)
+
         self._audio_device = QComboBox()
         self._audio_device.addItem(t("audio_disabled"))
         self._audio_device.addItem(t("system_default"))
@@ -243,8 +337,8 @@ class ControlPanel(QWidget):
                 self._audio_device.setCurrentIndex(idx)
         else:
             self._audio_device.setCurrentIndex(1)  # system default
-        asr_layout.addWidget(QLabel(t("label_audio")), 3, 0)
-        asr_layout.addWidget(self._audio_device, 3, 1)
+        asr_layout.addWidget(QLabel(t("label_audio")), 6, 0)
+        asr_layout.addWidget(self._audio_device, 6, 1)
         self._audio_device.currentIndexChanged.connect(self._auto_save)
 
         self._mic_device = QComboBox()
@@ -265,16 +359,16 @@ class ControlPanel(QWidget):
                 idx = self._mic_device.findText(saved_mic)
                 if idx >= 0:
                     self._mic_device.setCurrentIndex(idx)
-        asr_layout.addWidget(QLabel(t("label_mic")), 4, 0)
-        asr_layout.addWidget(self._mic_device, 4, 1)
+        asr_layout.addWidget(QLabel(t("label_mic")), 7, 0)
+        asr_layout.addWidget(self._mic_device, 7, 1)
         self._mic_device.currentIndexChanged.connect(self._auto_save)
 
         self._hub_combo = QComboBox()
         self._hub_combo.addItems([t("hub_modelscope"), t("hub_huggingface")])
         saved_hub = s.get("hub", "ms")
         self._hub_combo.setCurrentIndex(0 if saved_hub == "ms" else 1)
-        asr_layout.addWidget(QLabel(t("label_hub")), 5, 0)
-        asr_layout.addWidget(self._hub_combo, 5, 1)
+        asr_layout.addWidget(QLabel(t("label_hub")), 8, 0)
+        asr_layout.addWidget(self._hub_combo, 8, 1)
         self._hub_combo.currentIndexChanged.connect(self._auto_save)
 
         self._ui_lang_combo = QComboBox()
@@ -283,8 +377,8 @@ class ControlPanel(QWidget):
 
         saved_lang = s.get("ui_lang", get_lang())
         self._ui_lang_combo.setCurrentIndex(0 if saved_lang == "en" else 1)
-        asr_layout.addWidget(QLabel(t("label_ui_lang")), 6, 0)
-        asr_layout.addWidget(self._ui_lang_combo, 6, 1)
+        asr_layout.addWidget(QLabel(t("label_ui_lang")), 9, 0)
+        asr_layout.addWidget(self._ui_lang_combo, 9, 1)
         self._ui_lang_combo.currentIndexChanged.connect(self._on_ui_lang_changed)
 
         layout.addWidget(asr_group)
@@ -293,15 +387,10 @@ class ControlPanel(QWidget):
         self._whisper_group = QGroupBox(t("group_download_whisper"))
         whisper_layout = QHBoxLayout(self._whisper_group)
         self._whisper_size_combo = QComboBox()
-        self._whisper_size_combo.addItems(
-            ["tiny", "base", "small", "medium", "large-v3"]
-        )
         saved_size = s.get(
             "whisper_model_size", self._config["asr"].get("model_size", "medium")
         )
-        size_idx = self._whisper_size_combo.findText(saved_size)
-        if size_idx >= 0:
-            self._whisper_size_combo.setCurrentIndex(size_idx)
+        self._populate_whisper_models(saved_size)
         self._whisper_size_combo.currentIndexChanged.connect(
             self._on_whisper_size_changed
         )
@@ -317,7 +406,21 @@ class ControlPanel(QWidget):
         self._asr_engine.currentIndexChanged.connect(
             self._on_engine_changed_whisper_vis
         )
+        self._on_engine_changed_whisper_vis(engine_idx)
         self._update_whisper_size_label()
+
+        # Remote ASR server URL — only visible when engine is Remote Whisper
+        self._remote_group = QGroupBox("Remote ASR Server")
+        remote_layout = QHBoxLayout(self._remote_group)
+        remote_layout.addWidget(QLabel("URL"))
+        self._remote_url_edit = QLineEdit(
+            s.get("remote_asr_url", "http://127.0.0.1:8765")
+        )
+        self._remote_url_edit.setPlaceholderText("http://127.0.0.1:8765")
+        self._remote_url_edit.editingFinished.connect(self._auto_save)
+        remote_layout.addWidget(self._remote_url_edit, 1)
+        layout.addWidget(self._remote_group)
+        self._remote_group.setVisible(engine_idx == 3)
 
         mode_group = QGroupBox(t("group_vad_mode"))
         mode_layout = QVBoxLayout(mode_group)
@@ -408,7 +511,7 @@ class ControlPanel(QWidget):
 
         self._incremental_asr_cb = QCheckBox(t("label_incremental_asr"))
         self._incremental_asr_cb.setToolTip(t("incremental_asr_tooltip"))
-        self._incremental_asr_cb.setChecked(s.get("incremental_asr", True))
+        self._incremental_asr_cb.setChecked(s.get("incremental_asr", False))
         self._incremental_asr_cb.toggled.connect(self._on_timing_changed)
         self._incremental_asr_cb.toggled.connect(self._auto_save)
         timing_layout.addWidget(self._incremental_asr_cb, 4, 0)
@@ -418,7 +521,7 @@ class ControlPanel(QWidget):
         self._interim_interval_spin.setSingleStep(0.5)
         self._interim_interval_spin.setValue(s.get("interim_interval", 2.0))
         self._interim_interval_spin.setSuffix(" s")
-        self._interim_interval_spin.setEnabled(s.get("incremental_asr", True))
+        self._interim_interval_spin.setEnabled(s.get("incremental_asr", False))
         self._interim_interval_spin.valueChanged.connect(self._on_timing_changed)
         self._interim_interval_spin.valueChanged.connect(self._auto_save)
         self._incremental_asr_cb.toggled.connect(self._interim_interval_spin.setEnabled)
@@ -474,11 +577,12 @@ class ControlPanel(QWidget):
         self._prompt_preset.addItem(t("prompt_daily"), "daily")
         self._prompt_preset.addItem(t("prompt_esports"), "esports")
         self._prompt_preset.addItem(t("prompt_anime"), "anime")
+        self._prompt_preset.addItem(t("prompt_webid"), "webid")
         self._prompt_preset.addItem(t("prompt_custom"), "custom")
 
         current_prompt = s.get("system_prompt", DEFAULT_PROMPT)
-        preset_idx = 3  # default to custom
-        for i, key in enumerate(["daily", "esports", "anime"]):
+        preset_idx = 4  # default to custom
+        for i, key in enumerate(["daily", "esports", "anime", "webid"]):
             if current_prompt.strip() == PROMPT_PRESETS[key].strip():
                 preset_idx = i
                 break
@@ -901,8 +1005,24 @@ class ControlPanel(QWidget):
         return widget
 
     def _create_cache_tab(self):
+        from PyQt6.QtWidgets import QCheckBox
+
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        s = self._current_settings
+
+        # Transcript auto-save group
+        ts_group = QGroupBox(t("group_transcript"))
+        ts_layout = QHBoxLayout(ts_group)
+        self._auto_save_transcript_cb = QCheckBox(t("label_auto_save_transcript"))
+        self._auto_save_transcript_cb.setToolTip(t("auto_save_transcript_tooltip"))
+        self._auto_save_transcript_cb.setChecked(s.get("auto_save_transcript", True))
+        self._auto_save_transcript_cb.toggled.connect(self._auto_save)
+        ts_layout.addWidget(self._auto_save_transcript_cb, 1)
+        ts_open_btn = QPushButton(t("btn_open_transcripts"))
+        ts_open_btn.clicked.connect(self._open_transcripts_folder)
+        ts_layout.addWidget(ts_open_btn)
+        layout.addWidget(ts_group)
 
         top_row = QHBoxLayout()
         self._cache_total = QLabel("")
@@ -930,6 +1050,12 @@ class ControlPanel(QWidget):
         self._refresh_cache()
 
         return widget
+
+    def _open_transcripts_folder(self):
+        from pathlib import Path
+        ts_dir = Path(__file__).parent / "transcripts"
+        ts_dir.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(ts_dir))
 
     def _on_tab_changed(self, index):
         if index == self._cache_tab_index:
@@ -993,18 +1119,81 @@ class ControlPanel(QWidget):
 
     def _on_engine_changed_whisper_vis(self, index):
         self._whisper_group.setVisible(index == 0)
+        is_funasr = index == 1
+        if hasattr(self, "_funasr_model_combo"):
+            self._funasr_model_label.setVisible(is_funasr)
+            self._funasr_model_combo.setVisible(is_funasr)
+        if hasattr(self, "_whisper_pad_seconds"):
+            is_whisper = index == 0
+            self._whisper_pad_label.setVisible(is_whisper)
+            self._whisper_pad_seconds.setVisible(is_whisper)
+        if hasattr(self, "_sensevoice_pad_seconds"):
+            show_funasr_pad = is_funasr and funasr_supports_padding(
+                self._selected_funasr_model()
+            )
+            self._sensevoice_pad_label.setVisible(show_funasr_pad)
+            self._sensevoice_pad_seconds.setVisible(show_funasr_pad)
+        if hasattr(self, "_remote_group"):
+            self._remote_group.setVisible(index == 3)
         # Resize window to fit content after whisper group visibility change
-        def _fit():
-            self.adjustSize()
-            h = self.sizeHint().height() + 20
-            self.resize(self.width(), max(h, self.minimumHeight()))
-        QTimer.singleShot(0, _fit)
+        QTimer.singleShot(0, self._fit_height)
+
+    def _selected_funasr_model(self) -> str:
+        value = self._funasr_model_combo.currentData()
+        return normalize_funasr_model_key(str(value) if value else None)
+
+    def _on_funasr_model_changed(self):
+        self._current_settings["funasr_model"] = self._selected_funasr_model()
+        self._on_engine_changed_whisper_vis(self._asr_engine.currentIndex())
+        self._auto_save()
+
+    def _selected_whisper_model(self) -> str:
+        value = self._whisper_size_combo.currentData()
+        return str(value) if value else self._whisper_size_combo.currentText()
+
+    def _populate_whisper_models(self, saved_value: str):
+        self._whisper_size_combo.clear()
+        for size in _WHISPER_SIZES:
+            self._whisper_size_combo.addItem(size, size)
+
+        local_prefix = t("whisper_local_prefix")
+        for item in list_local_faster_whisper_models():
+            idx = self._whisper_size_combo.count()
+            self._whisper_size_combo.addItem(
+                f"{local_prefix}: {item['name']}", item["path"]
+            )
+            self._whisper_size_combo.setItemData(
+                idx, item["path"], Qt.ItemDataRole.ToolTipRole
+            )
+
+        selected = resolve_custom_whisper_model(saved_value) or saved_value
+        idx = self._whisper_size_combo.findData(selected)
+        if idx < 0:
+            idx = self._whisper_size_combo.findText(saved_value)
+        if idx < 0 and selected:
+            label = f"{t('whisper_missing_local')}: {Path(str(selected)).name}"
+            idx = self._whisper_size_combo.count()
+            self._whisper_size_combo.addItem(label, selected)
+            self._whisper_size_combo.setItemData(
+                idx, str(selected), Qt.ItemDataRole.ToolTipRole
+            )
+        if idx >= 0:
+            self._whisper_size_combo.setCurrentIndex(idx)
 
     def _update_whisper_size_label(self):
         from model_manager import is_asr_cached, _MODEL_SIZE_BYTES
 
-        size = self._whisper_size_combo.currentText()
+        size = self._selected_whisper_model()
         cached = is_asr_cached("whisper", size, self._current_settings.get("hub", "ms"))
+        if size not in _WHISPER_SIZES:
+            if cached:
+                self._whisper_status.setText(t("whisper_local_ready"))
+                self._whisper_status.setStyleSheet("color: #4a4; font-size: 11px;")
+            else:
+                self._whisper_status.setText(t("whisper_invalid_local"))
+                self._whisper_status.setStyleSheet("color: #d66; font-size: 11px;")
+            self._whisper_dl_btn.setEnabled(False)
+            return
         if cached:
             self._whisper_status.setText(t("whisper_already_cached"))
             self._whisper_status.setStyleSheet("color: #4a4; font-size: 11px;")
@@ -1017,20 +1206,22 @@ class ControlPanel(QWidget):
 
     def _on_whisper_size_changed(self):
         self._current_settings["whisper_model_size"] = (
-            self._whisper_size_combo.currentText()
+            self._selected_whisper_model()
         )
         self._update_whisper_size_label()
         # If already cached, switch engine immediately
         from model_manager import is_asr_cached
 
-        size = self._whisper_size_combo.currentText()
+        size = self._selected_whisper_model()
         if is_asr_cached("whisper", size, self._current_settings.get("hub", "ms")):
             self._auto_save()
 
     def _download_whisper(self):
         from model_manager import is_asr_cached, get_missing_models
 
-        size = self._whisper_size_combo.currentText()
+        size = self._selected_whisper_model()
+        if size not in _WHISPER_SIZES:
+            return
         hub = self._current_settings.get("hub", "ms")
         if is_asr_cached("whisper", size, hub):
             return
@@ -1241,8 +1432,8 @@ class ControlPanel(QWidget):
             # Update preset combo to reflect current state
             from translator import PROMPT_PRESETS
             self._prompt_preset.blockSignals(True)
-            matched = 3  # custom
-            for i, key in enumerate(["daily", "esports", "anime"]):
+            matched = 4  # custom
+            for i, key in enumerate(["daily", "esports", "anime", "webid"]):
                 if text.strip() == PROMPT_PRESETS[key].strip():
                     matched = i
                     break
@@ -1253,17 +1444,21 @@ class ControlPanel(QWidget):
         self._current_settings["asr_language"] = self._get_asr_lang_code()
         engine_map = {
             0: "whisper",
-            1: "sensevoice",
-            2: "funasr-nano",
-            3: "funasr-mlt-nano",
-            4: "qwen3-asr",
-            5: "voxtral-mini-4b-realtime-2602-gguf",
+            1: "funasr",
+            2: "anime-whisper",
+            3: "remote-whisper",
+            4: "voxtral-mini-4b-realtime-2602-gguf",
         }
-        self._current_settings["asr_engine"] = engine_map[
-            self._asr_engine.currentIndex()
-        ]
+        self._current_settings["asr_engine"] = engine_map.get(
+            self._asr_engine.currentIndex(), "whisper"
+        )
+        self._current_settings["funasr_model"] = self._selected_funasr_model()
+        if hasattr(self, "_remote_url_edit"):
+            url = self._remote_url_edit.text().strip()
+            if url:
+                self._current_settings["remote_asr_url"] = url
         self._current_settings["whisper_model_size"] = (
-            self._whisper_size_combo.currentText()
+            self._selected_whisper_model()
         )
         dev_text = self._asr_device.currentText()
         self._current_settings["asr_device"] = dev_text.split(" (")[0]
@@ -1284,10 +1479,22 @@ class ControlPanel(QWidget):
         self._current_settings["hub"] = (
             "ms" if self._hub_combo.currentIndex() == 0 else "hf"
         )
+        self._current_settings["sensevoice_pad_seconds"] = round(
+            self._sensevoice_pad_seconds.value(), 2
+        )
+        self._current_settings["whisper_pad_seconds"] = round(
+            self._whisper_pad_seconds.value(), 2
+        )
         prompt_text = self._prompt_edit.toPlainText().strip()
         if prompt_text:
             self._current_settings["system_prompt"] = prompt_text
         self._current_settings["timeout"] = self._timeout_spin.value()
+        if hasattr(self, "_incremental_asr_cb"):
+            self._on_timing_changed()
+        if hasattr(self, "_auto_save_transcript_cb"):
+            self._current_settings["auto_save_transcript"] = (
+                self._auto_save_transcript_cb.isChecked()
+            )
         if hasattr(self, "_style_preset"):
             self._current_settings["style"] = self._collect_style()
         safe = {

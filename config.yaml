@@ -9,8 +9,12 @@ audio:
   chunk_duration: 0.032
 
 asr:
+  # ASR engine: whisper, funasr, anime-whisper
+  asr_engine: "funasr"
   # Model size: tiny, base, small, medium, large-v3
   model_size: "medium"
+  # FunASR model: sensevoice-small, funasr-nano-2512, funasr-mlt-nano-2512
+  funasr_model: "sensevoice-small"
   # Device: cuda or cpu
   device: "cuda"
   # Compute type: float16, int8_float16, int8
@@ -23,6 +27,10 @@ asr:
   max_speech_duration: 8.0
   # VAD threshold (0.0 - 1.0)
   vad_threshold: 0.5
+  # SenseVoice input padding bucket in seconds (0 = disabled)
+  sensevoice_pad_seconds: 0.5
+  # faster-whisper input padding bucket in seconds (0 = disabled)
+  whisper_pad_seconds: 0.5
 
 translation:
   # OpenAI-compatible API settings
