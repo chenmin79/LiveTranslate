@@ -28,3 +28,5 @@ dist/
 build/
 release/
 *.egg-info/
+
+qwen_asr_gguf/inference/bin/
