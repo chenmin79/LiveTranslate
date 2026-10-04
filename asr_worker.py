@@ -92,6 +92,18 @@ def _load_engine(config: dict):
         engine = FunASRNanoEngine(
             device=device, hub=hub, engine_type=engine_type
         )
+    elif engine_type == "qwen3-asr":
+        from asr_qwen3 import Qwen3ASREngine
+        from model_manager import get_qwen3_asr_model_dir
+
+        model_dir = config.get("model_dir") or get_qwen3_asr_model_dir()
+        use_dml = config.get("use_dml", False)
+        chunk_size = float(config.get("chunk_size", 10.0))
+        engine = Qwen3ASREngine(
+            model_dir=model_dir,
+            use_dml=use_dml,
+            chunk_size=chunk_size,
+        )
     else:
         from asr_engine import ASREngine
 

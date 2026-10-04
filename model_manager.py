@@ -143,6 +143,7 @@ ASR_DISPLAY_NAMES = {
     "voxtral-mini-4b-realtime-2602-gguf": "Voxtral Mini 4B Realtime",
     "anime-whisper": "Anime-Whisper",
     "remote-whisper": "Remote-Whisper",
+    "qwen3-asr": "Qwen3-ASR-1.7B",
 }
 
 _MODEL_SIZE_BYTES = {
@@ -156,6 +157,7 @@ _MODEL_SIZE_BYTES = {
     "whisper-medium": 1_530_000_000,
     "whisper-large-v3": 3_100_000_000,
     "anime-whisper": 3_100_000_000,
+    "qwen3-asr": 770_000_000,
 }
 
 _WHISPER_SIZES = ["tiny", "base", "small", "medium", "large-v3"]
@@ -748,3 +750,33 @@ def get_cache_entries():
                 break
 
     return entries
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-ASR-1.7B (ONNX encoder + GGUF LLM)
+# ---------------------------------------------------------------------------
+
+QWEN3_ASR_DIR_NAME = "qwen3-asr"
+QWEN3_ASR_FILES = [
+    "qwen3_asr_encoder_frontend.int4.onnx",
+    "qwen3_asr_encoder_backend.int4.onnx",
+    "qwen3_asr_llm.q4_k.gguf",
+]
+QWEN3_ASR_MODEL_URL = (
+    "https://github.com/HaujetZhao/Qwen3-ASR-GGUF/releases/download/models/"
+    "Qwen3-ASR-1.7B-gguf.zip"
+)
+
+
+def is_qwen3_asr_ready() -> bool:
+    """True when model files AND llama.cpp DLLs are both present."""
+    model_dir = MODELS_DIR / QWEN3_ASR_DIR_NAME
+    if not all((model_dir / fn).exists() for fn in QWEN3_ASR_FILES):
+        return False
+    bin_dir = APP_DIR / "qwen_asr_gguf" / "inference" / "bin"
+    return (bin_dir / "llama.dll").exists() or (bin_dir / "llama.so").exists()
+
+
+def get_qwen3_asr_model_dir() -> str:
+    """Return the Qwen3-ASR model directory path."""
+    return str((MODELS_DIR / QWEN3_ASR_DIR_NAME).resolve())
